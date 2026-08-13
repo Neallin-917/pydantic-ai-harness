@@ -433,6 +433,9 @@ class TestInjectionMechanics:
 
 
 class TestCachePointLayout:
+    def test_plain_prompt_has_no_injected_cache_point_prefix(self) -> None:
+        assert not _injected_cache_point_follows_opening_tag(_fresh_request())
+
     async def test_tagged_reminder_has_its_own_cache_point_prefix(self) -> None:
         cap = SystemReminders[None](reminders=[Reminder('r')])
         seen = await _run_wrap(cap, _fresh_request())
@@ -458,6 +461,7 @@ class TestCachePointLayout:
         seen = await _run_wrap(cap, _fresh_request())
         assert _fired_text(seen) == 'r'
         assert not _has_cache_point(seen)
+        assert not _injected_cache_point_follows_opening_tag(seen)
 
     async def test_dynamic_reminder_omits_cache_point(self) -> None:
         cap = SystemReminders[None](dynamic_reminders=[lambda ctx: 'r'])
