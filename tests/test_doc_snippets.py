@@ -117,6 +117,22 @@ def test_doc_snippets_discovered() -> None:
     assert sum(1 for _ in _doc_snippets()) >= 100
 
 
+def _spend_snippets() -> Iterable[ParameterSet]:
+    for parameter in _doc_snippets():
+        example = parameter.values[0]
+        if isinstance(example, CodeExample) and 'SpendLimits[None]' in example.source:
+            yield parameter
+
+
+def test_spend_snippets_discovered() -> None:
+    assert sum(1 for _ in _spend_snippets()) == 4
+
+
+@pytest.mark.parametrize('example', _spend_snippets())
+def test_spend_snippets_define_on_supported_python(example: CodeExample) -> None:
+    exec(example.source, {})
+
+
 def test_snippet_problem_detects_each_failure_mode() -> None:
     # Valid: harness imports that resolve, star imports, plain imports, and non-harness imports.
     assert _snippet_problem('from pydantic_ai_harness import CodeMode') is None
