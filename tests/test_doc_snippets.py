@@ -26,7 +26,8 @@ deliberately continue an earlier block's namespace.
 
 The check reads names only. A snippet calling a method that has since been
 renamed is an attribute access, which neither this nor `_snippet_problem` sees,
-and nothing in this repo type-checks a snippet's annotations.
+and nothing in this repo type-checks a snippet's annotations. A star import
+blanks it out entirely: ruff downgrades `F821` to `F405` while one is in scope.
 """
 
 from __future__ import annotations as _annotations
@@ -161,15 +162,21 @@ def _undefined_names(example: CodeExample) -> list[str]:
         input=example.source,
         capture_output=True,
         text=True,
+        # A snippet measures ~12ms, so this cannot flake; it bounds a wedged ruff well
+        # under the CI job's own timeout.
+        timeout=60,
     )
     if result.returncode > 1:  # pragma: no cover - ruff itself failed, not the snippet
         raise RuntimeError(f'ruff failed on {example.path}:{example.start_line}: {result.stderr or result.stdout}')
     # ruff numbers the snippet from 1; the fence line is `start_line`, so its first
     # line of code is the next one. `indent` is what `find_examples` dedented away.
-    return [
+    problems = [
         f'{example.path}:{example.start_line + int(row)}:{int(column) + example.indent} {message}'
         for row, column, message in _F821.findall(result.stdout)
     ]
+    if result.returncode == 1 and not problems:
+        raise RuntimeError(f'ruff reported a violation this cannot read: {result.stdout}')
+    return problems
 
 
 def _name_checked_snippets() -> Iterable[ParameterSet]:
@@ -180,8 +187,23 @@ def _name_checked_snippets() -> Iterable[ParameterSet]:
 
 
 def test_name_checked_snippets_discovered() -> None:
-    # Guard against a discovery break silently making the check vacuous.
-    assert sum(1 for _ in _name_checked_snippets()) >= 4
+    """Every block annotating with `SpendLimits[None]` carries the fence directive.
+
+    A count floor does not guard this. Eight blocks are marked and only four were ever
+    broken, so a floor of four is met by the four that were always fine, and #690's own
+    bug ships green. `prefix_settings()` is a free-form `key="value"` parse with no key
+    validation, so a misspelled directive reads as no directive at all.
+    """
+    marked = {parameter.id for parameter in _name_checked_snippets()}
+    annotating: set[str] = set()
+    for parameter in _doc_snippets():
+        example = parameter.values[0]
+        if isinstance(example, CodeExample) and 'SpendLimits[None]' in example.source:
+            annotating.add(f'{example.path}:{example.start_line}')
+    assert annotating, 'discovery found no `SpendLimits[None]` blocks at all; the check has gone vacuous'
+    assert annotating <= marked, (
+        f'`SpendLimits[None]` blocks with no `{{names="defined"}}` fence directive: {sorted(annotating - marked)}'
+    )
 
 
 @pytest.mark.parametrize('example', _name_checked_snippets())
@@ -199,6 +221,17 @@ def test_undefined_names_detects_both_shapes() -> None:
     in_body = CodeExample.create('async def start() -> None:\n    await workflow_handle.execute()\n', start_line=40)
     assert _undefined_names(in_body) == ['testing.md:42:11 F821 Undefined name `workflow_handle`']
     assert _undefined_names(CodeExample.create('x = 1\nprint(x)\n')) == []
+    # `find_examples` dedents an indented fence, so the column has to be shifted back onto it.
+    indented = CodeExample.create('print(undefined_here)\n', start_line=40, indent=2)
+    assert _undefined_names(indented) == ['testing.md:41:9 F821 Undefined name `undefined_here`']
+
+
+def test_undefined_names_refuses_a_verdict_it_cannot_read() -> None:
+    # ruff exits 1 on a snippet it cannot parse and emits no `F821` at all, because it
+    # cannot resolve names in a file it cannot parse. Returning `[]` would report that
+    # snippet clean -- and so would an output format that has moved.
+    with pytest.raises(RuntimeError, match='cannot read'):
+        _undefined_names(CodeExample.create('x: Foo = 1\ndef (:\n'))
 
 
 def test_snippet_problem_detects_each_failure_mode() -> None:
