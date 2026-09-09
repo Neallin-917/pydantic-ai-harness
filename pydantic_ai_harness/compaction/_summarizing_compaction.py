@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field, replace
+from collections.abc import AsyncIterable, Callable, Sequence
+from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic_ai._run_context import AgentDepsT
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.agent import EventStreamHandler
+from pydantic_ai.capabilities import AbstractCapability, durable_operation
 from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import (
     ModelMessage,
@@ -22,8 +23,10 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import RunContext
 
+from pydantic_ai_harness._usage import reserved_usage_limits
 from pydantic_ai_harness.compaction._context_window import DEFAULT_CONTEXT_WINDOW
 from pydantic_ai_harness.compaction._pinning import is_pinned, reinject_pinned
 from pydantic_ai_harness.compaction._receipts import (
@@ -43,12 +46,13 @@ from pydantic_ai_harness.compaction._shared import (
     find_safe_cutoff,
     find_token_cutoff,
     is_realtime_model,
+    record_compaction_reclaim,
     resolve_token_trigger,
     validate_token_trigger,
 )
 
 if TYPE_CHECKING:
-    from pydantic_ai.messages import ModelRequestPart, UserContent
+    from pydantic_ai.messages import AgentStreamEvent, ModelRequestPart, UserContent
     from pydantic_ai.models import AbstractModel, ModelRequestContext
 
 _DEFAULT_SUMMARY_PROMPT = """\
@@ -83,6 +87,10 @@ preamble, no markdown fences.
 {messages}
 </messages>\
 """
+
+_DEFAULT_INSTRUCTIONS = (
+    'You are a context summarization assistant. Extract the most important information from conversations.'
+)
 
 _SUMMARY_PREFIX = 'Summary of previous conversation:\n\n'
 
@@ -230,6 +238,20 @@ def _is_kept_user_message(message: ModelRequest) -> bool:
     return message.metadata is not None and message.metadata.get(_KEPT_USER_MESSAGE_METADATA) is True
 
 
+async def drain_summary_events(
+    _ctx: RunContext[object],
+    events: AsyncIterable[AgentStreamEvent],
+) -> None:
+    """An `event_stream_handler` that consumes summary events and yields nothing to the caller.
+
+    Pass this as `SummarizingCompaction(event_stream_handler=drain_summary_events)` when the summary
+    endpoint requires a streaming request but the events themselves are not wanted. Supplying
+    any handler selects the streaming request path; this one just discards what it receives.
+    """
+    async for _ in events:
+        pass
+
+
 @dataclass
 class SummarizingCompaction(AbstractCapability[AgentDepsT]):
     """LLM-powered conversation compaction.
@@ -267,6 +289,24 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
     When `None`, inherits the model the request being compacted is going to. Core starts
     that as the run's model, so the two differ only where a capability replaced
     `ModelRequestContext.model`; set this explicitly to pin the summarizer regardless.
+    """
+
+    model_settings: ModelSettings | None = field(default=None, kw_only=True)
+    """Settings for the dedicated summary model call.
+
+    These merge over defaults carried by `model`, allowing the summary call to use a
+    policy that differs from the running agent without mutating the model.
+    """
+
+    event_stream_handler: EventStreamHandler[object] | None = field(default=None, kw_only=True)
+    """If set, this handler is passed to the nested summary run, so the summarizer's own
+    model-streaming events surface to the caller.
+
+    Setting it also selects the streaming request path, which is what a summarizer endpoint
+    that rejects non-streaming requests needs; pass `drain_summary_events` to take that path without
+    handling the events. Left `None`, the summary request is non-streaming, which is what an
+    endpoint that rejects streaming requests needs. The handler receives the summary run's own
+    `RunContext`, never the outer run's, and the outer `Agent.run(...)` handler is not inherited.
     """
 
     max_messages: int | None = None
@@ -308,6 +348,14 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
     """Prompt template for generating summaries.
 
     Must contain a ``{messages}`` placeholder.
+    """
+
+    instructions: str = field(default=_DEFAULT_INSTRUCTIONS, kw_only=True)
+    """Instructions for the internal agent that writes the summary.
+
+    `summary_prompt` shapes the user turn of the summary request; this sets the internal
+    agent's static instructions, which Pydantic AI sends in the request's system prompt.
+    Override it when the summarizer endpoint requires a fixed leading instruction.
     """
 
     tokenizer: Callable[[str], int] | None = None
@@ -355,6 +403,10 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
     Opt-in for now: the receipt text is content, so defaulting it on is deferred to the
     benchmark eval-rig pass.  The mechanism itself is structural.
     """
+
+    # Override the inherited default ID because durable-operation recovery needs a stable identity.
+    _: KW_ONLY
+    id: str | None = 'summarizing_compaction'
 
     def __post_init__(self) -> None:
         if self.max_messages is None and self.max_tokens is None and self.max_fraction is None:
@@ -472,13 +524,9 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         return out
 
     def _truncate(self, text: str, max_chars: int | None = None) -> str:
-        from pydantic_ai_harness.tool_output_limits import TruncationStrategy
-        from pydantic_ai_harness.tool_output_limits._payload import truncate_text
-
         limit = self.keep_user_messages_max_chars if max_chars is None else max_chars
-        truncated = truncate_text(text, limit, TruncationStrategy.head)
-        if len(truncated) <= limit:
-            return truncated
+        if len(text) <= limit:
+            return text
         marker = '[...]'
         if limit <= len(marker):
             return marker[:limit]
@@ -566,17 +614,30 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         token_trigger = resolve_token_trigger(
             self.max_tokens, self.max_fraction, request_ctx.model, self.fallback_context_window, self.context_window
         )
-        if not exceeds(messages, self.max_messages, token_trigger, self.tokenizer):
+        if not exceeds(
+            messages,
+            self.max_messages,
+            token_trigger,
+            self.tokenizer,
+            model_request_parameters=request_context.model_request_parameters,
+        ):
             return request_context
-        request_context.messages = await compact_with_span(
+        compacted = await compact_with_span(
             request_ctx,
             strategy='SummarizingCompaction',
             messages=messages,
             compact=lambda: self.compact(messages, request_ctx),
             tokenizer=self.tokenizer,
         )
+        record_compaction_reclaim(
+            request_context,
+            estimate_token_count(messages, self.tokenizer),
+            estimate_token_count(compacted, self.tokenizer),
+        )
+        request_context.messages = compacted
         return request_context
 
+    @durable_operation('summarize')
     async def _summarize(
         self,
         messages: list[ModelMessage],
@@ -610,7 +671,14 @@ class SummarizingCompaction(AbstractCapability[AgentDepsT]):
         # `Model[Any]`, mirroring core's own `reinject_system_prompt` idiom.
         agent: Agent[None, str] = Agent(
             cast('Model[Any] | str', model),
-            instructions='You are a context summarization assistant. Extract the most important information from conversations.',
+            name='summarizing_compaction',
+            instructions=self.instructions,
+            model_settings=self.model_settings,
         )
-        result = await agent.run(prompt, usage=ctx.usage)
+        result = await agent.run(
+            prompt,
+            usage=ctx.usage,
+            usage_limits=reserved_usage_limits(ctx.usage_limits),
+            event_stream_handler=self.event_stream_handler,
+        )
         return result.output.strip()

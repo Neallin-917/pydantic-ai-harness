@@ -22,6 +22,8 @@ from collections.abc import Callable, Container, Coroutine
 from dataclasses import dataclass, field
 from typing import Any
 
+import anyio
+
 try:
     from pydantic_monty import (
         CollectString,
@@ -131,8 +133,15 @@ class MontyExecutor:
                 # point; await them so dispatched work (e.g. sub-agent runs mutating shared
                 # usage) has fully unwound before this returns. `return_exceptions=True` keeps
                 # one task's teardown error from masking the original exception, and the
-                # results are deliberately discarded.
-                await asyncio.gather(*cancelled, return_exceptions=True)
+                # results are deliberately discarded. Shielded: run cancellation can land here
+                # with an enclosing anyio scope already cancelled, and that scope re-cancels
+                # its tasks on every event-loop cycle -- each delivery either aborts this await
+                # outright (abandoning the tasks mid-unwind) or is forwarded through the
+                # `gather` into every task, breaking any await their cleanup performs. The
+                # shield holds for anyio-scope cancellation; a raw second `Task.cancel()` can
+                # still pierce it.
+                with anyio.CancelScope(shield=True):
+                    await asyncio.gather(*cancelled, return_exceptions=True)
         return state
 
     async def _handle_function(self, snapshot: FunctionSnapshot) -> MontyState:
@@ -159,12 +168,25 @@ class MontyExecutor:
             # there, `run`'s cleanup would never close it.
             for cid in list(self._pending):
                 self._pre_resolved[cid] = await _await_external(self._pending.pop(cid))
+            try:
+                call = self.dispatch(name, snapshot.kwargs)
+            except Exception as exc:
+                return snapshot.resume({'exception': exc})
             # The wrapped outcome (`{'return_value': ...}` / `{'exception': ...}`) is already
             # exactly the payload `resume` expects.
-            return snapshot.resume(await _await_external(self.dispatch(name, snapshot.kwargs)))
+            return snapshot.resume(await _await_external(call))
 
         # Deferred execution -- resolved later at FutureSnapshot.
-        call = self.dispatch(name, snapshot.kwargs)
+        try:
+            call = self.dispatch(name, snapshot.kwargs)
+        except Exception as exc:
+            # `dispatch` refused the call before building its coroutine (e.g. an exhausted
+            # per-snippet budget). Deliver the error at the sandbox call site, the same way a
+            # failure raised inside the coroutine is delivered, rather than letting it abort the
+            # feed: calls that already completed keep the results the host recorded for them, and
+            # the snippet can still return them. Nothing was scheduled, so there is no task to
+            # clean up and no further work is admitted.
+            return snapshot.resume({'exception': exc})
         if self.global_sequential:
             # Keep the bare coroutine unscheduled; it's awaited one-at-a-time to avoid interleaving.
             self._pending[snapshot.call_id] = call

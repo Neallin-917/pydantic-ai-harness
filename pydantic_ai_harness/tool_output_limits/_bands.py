@@ -35,11 +35,12 @@ class Passthrough:
 
 @dataclass(frozen=True)
 class Truncate:
-    """Clamp the stringified return to `max_chars`. Lossy, zero-cost, no read-back.
+    """Clamp the stringified return to `max_chars`, including the truncation marker.
 
-    `max_chars` is always characters, independent of the capability's `over_tokens` size
-    unit (truncation is a character operation). Falls back to `then` for binary payloads,
-    which cannot be stringify-truncated.
+    Lossy, zero-cost, no read-back. `max_chars` is always characters, independent of the
+    capability's `over_tokens` size unit. If the budget cannot fit both retained content and
+    a complete marker, truncation keeps only the selected slice. A non-positive cap returns
+    an empty string. Falls back to `then` for binary payloads, which cannot be stringify-truncated.
     """
 
     strategy: TruncationStrategy = TruncationStrategy.head_tail
@@ -66,7 +67,9 @@ class Summarize:
     `model=None` inherits the running agent's model (`ctx.model`), mirroring
     `SummarizingCompaction`. Pass a model id / instance to override, or a `summarize`
     callable to bypass the built-in prompt entirely. Summary usage folds into `ctx.usage`;
-    no token caps are imposed. Falls back to `then` on a binary payload or a failed call.
+    the built-in agent receives the parent usage limits and reserves one request from a finite
+    request limit for the pending parent request. Falls back to `then` on a binary payload or a
+    failed call.
     """
 
     model: str | Model | None = None

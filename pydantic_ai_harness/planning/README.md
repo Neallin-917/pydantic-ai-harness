@@ -1,14 +1,5 @@
 # Planning
 
-> [!NOTE]
-> Import this capability from its submodule -- there is no top-level `pydantic_ai_harness` re-export:
->
-> ```python
-> from pydantic_ai_harness.planning import Planning
-> ```
->
-> The API may change between releases. Where practical, breaking changes ship with a deprecation warning.
-
 Give an agent a structured, self-updating task list -- without ever invalidating the prompt cache. Optionally persist it, break steps into subtasks with dependencies, and react to changes through events.
 
 [Source](https://github.com/pydantic/pydantic-ai-harness/tree/main/pydantic_ai_harness/planning/)
@@ -31,7 +22,7 @@ So the plan stays current in the model's view while the cached prefix is never i
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.planning import Planning
+from pydantic_ai_harness import Planning
 
 agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[Planning()])
 
@@ -75,7 +66,8 @@ Pass `enable_subtasks=True` to add three more tools and the `blocked` status:
 By default the plan lives in memory for the duration of a single run (a fresh, isolated plan per run via `for_run`). Pass a `store` to persist it, or a `store_resolver` to pick one per run:
 
 ```python
-from pydantic_ai_harness.planning import Planning, SqlitePlanStore
+from pydantic_ai_harness import Planning
+from pydantic_ai_harness.planning import SqlitePlanStore
 
 agent_store = SqlitePlanStore('plan.db', session='user-123')
 planning = Planning(store=agent_store)
@@ -122,23 +114,27 @@ The planner's read-only discipline is a property of how you configure that agent
 
 ## Events
 
-Give a store a `PlanEventEmitter` to react to changes -- surface progress in a UI, mirror steps to a tracker, notify a channel on completion:
+Subscribe to typed plan events to react to changes made through the `Planning` tools:
 
 ```python
-from pydantic_ai_harness.planning import InMemoryPlanStore, PlanEventEmitter
+from pydantic_ai import Agent
+from pydantic_ai_harness import Planning
+from pydantic_ai_harness.planning import PlanCompletedEvent
 
-emitter = PlanEventEmitter()
+agent = Agent('anthropic:claude-sonnet-4-6', capabilities=[Planning()])
 
-@emitter.on_completed
-async def announce(event):
+@agent.on_event(PlanCompletedEvent)
+async def announce(ctx, event):
     print('done:', event.item.content)
-
-store = InMemoryPlanStore(event_emitter=emitter)
 ```
 
-Emitted types: `created`, `updated`, `status_changed`, `completed`, `deleted`.
+The family contains
+`PlanCreatedEvent`, `PlanUpdatedEvent`, `PlanStatusChangedEvent`, `PlanCompletedEvent`, and
+`PlanDeletedEvent`; each carries the affected `item` and, for updates, `previous_state`.
 
-Events come from the granular tools (`add_task`, `update_task_status`, `add_subtask`, ...). `write_plan` is a bulk whole-plan replacement and is **event-silent**, so a UI driven purely off events won't see plans the model builds or rewrites with `write_plan`. Read the plan after the run too, or steer the model toward the granular tools when you need live event coverage.
+Run events come from planning tool paths, including `write_plan`. Direct application mutations on a
+`PlanStore` have no run context and do not produce run events. `PlanEventEmitter`, `EventCallback`,
+and store `event_emitter` parameters remain supported but are deprecated.
 
 ## Why whole-plan replacement
 
@@ -148,10 +144,15 @@ Addressing steps by mutable integer index (insert/remove/reorder) is error-prone
 
 The plan is never injected into the system prompt or instructions. Static usage guidance goes there (cache-stable); only the mutable plan rides the ephemeral tail reminder. Set `inject=False` to disable the reminder entirely. Pydantic AI maps `CachePoint` for models whose profiles support prompt caching; on other models it is ignored.
 
+With a durable-execution capability attached, the plan read used to build that reminder is a
+journaled capability operation. Replay reuses the recorded plan instead of reading the store again.
+`Planning` carries the stable default `id='planning'`, so durable recovery works without
+configuration.
+
 ## Configuration
 
 ```python
-from pydantic_ai_harness.planning import Planning
+from pydantic_ai_harness import Planning
 
 Planning(
     guidance=None,           # static system-prompt guidance; None = default, '' = omit
@@ -177,7 +178,7 @@ capabilities:
 
 ```python
 from pydantic_ai import Agent
-from pydantic_ai_harness.planning import Planning
+from pydantic_ai_harness import Planning
 
 agent = Agent.from_file('agent.yaml', custom_capability_types=[Planning])
 ```
